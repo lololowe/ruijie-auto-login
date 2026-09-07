@@ -271,12 +271,12 @@ func (c *Client) GetCurrentUser(ctx context.Context) (*UserInfo, bool, error) {
 	return info, false, nil
 }
 
-// CheckInternet 使用微软连通性检测判断互联网是否可用。
+// CheckInternet 使用 Apple 连通性检测页判断互联网是否可用。
 func (c *Client) CheckInternet(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
-		"http://www.msftconnecttest.com/connecttest.txt",
+		"https://www.apple.com/library/test/success.html",
 		nil,
 	)
 	if err != nil {
@@ -300,5 +300,5 @@ func (c *Client) CheckInternet(ctx context.Context) bool {
 		return false
 	}
 
-	return strings.Contains(string(body), "Microsoft Connect Test")
+	return strings.Contains(string(body), "Success")
 }
