@@ -1,4 +1,7 @@
 config.json
+shell/config.sh
 *.exe
 ruijie-autologin-android
 ruijie-autologin-ish
+todo.json
+available_accounts.json

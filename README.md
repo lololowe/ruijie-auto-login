@@ -166,9 +166,14 @@ ruijie-auto-login/
 │       ├── auth.go
 │       └── monitor.go
 │
-└── cmd/
-    └── autologin/
-        └── main.go
+├── cmd/
+│   └── autologin/
+│       └── main.go
+│
+└── shell/
+    ├── autologin.sh
+    ├── config.sh.example
+    └── config.sh          # 本地配置，不提交到仓库
 ```
 
 ### `internal/ruijie/config.go`
@@ -361,6 +366,56 @@ ruijie-autologin.exe --once
 ```bash
 go run ./cmd/autologin
 ```
+
+## Shell 版本
+
+项目额外提供了一个纯 POSIX Shell 实现，位于 `shell/autologin.sh`。
+
+它不依赖 Go、Python、Node.js、jq，只依赖 `sh`、`curl`、`sed`、`grep`、`awk`、`sleep`，可以直接在以下环境运行：
+
+- iOS + iSH
+- Android + Termux
+- 常见 Linux
+
+### 准备配置
+
+Shell 版本不复用 `config.json`（避免依赖 jq），使用独立的 `shell/config.sh`：
+
+```bash
+cd shell
+cp config.sh.example config.sh
+# 编辑 config.sh，填写 PORTAL_BASE 和账号列表
+```
+
+账号格式为每行一个 `账号|密码`：
+
+```text
+ACCOUNTS="
+账号A|密码A
+账号B|密码B
+"
+```
+
+### 运行
+
+```bash
+chmod +x shell/autologin.sh
+
+./shell/autologin.sh            # 持续监控，掉线自动重新登录
+./shell/autologin.sh --status   # 查询当前在线状态
+./shell/autologin.sh --logout   # 注销当前登录
+./shell/autologin.sh --once     # 单次检查并登录，成功后退出
+./shell/autologin.sh --help     # 显示帮助
+```
+
+`--once` 专为 iSH / Termux 设计：登录成功后立即退出，不进入持续监控，适合由系统快捷指令启动。
+
+Shell 版本与 Go 版本使用完全相同的锐捷认证流程：
+
+- 通过 `http://119.29.29.29/` 发现 ePortal 登录参数
+- `POST /eportal/InterFace.do?method=login` 登录
+- `getOnlineUserInfo` 验证在线（`result=wait` 但带 `userId`/`userIp` 也视为在线）
+- 随机账号起点 + 顺序轮询
 
 ## 当前登录用户检测
 
