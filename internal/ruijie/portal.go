@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -77,12 +78,57 @@ func (c *Client) PortalBase() string {
 	return strings.TrimRight(c.Config.PortalBase, "/")
 }
 
-// DiscoverPortal 从微软连通性检测地址获取锐捷 ePortal 登录参数。
+// portalProbeURL 是用于触发锐捷网关拦截的参数探测地址。
+// 未认证时锐捷网关会拦截该 HTTP 请求，
+// 并在响应正文中返回真正的 ePortal 登录地址。
+const portalProbeURL = "http://119.29.29.29/"
+
+/*
+典型锐捷返回：
+
+<script>
+top.self.location.href='http://172.16.32.240/eportal/index.jsp?...'
+</script>
+
+这里只匹配被引号包裹的 ePortal 登录地址本身，
+兼容单引号、双引号以及不同的赋值写法。
+[^'"]+ 保证 query 中的 & 不会被截断。
+*/
+var portalURLPattern = regexp.MustCompile(
+	`['"](https?://[^'"]+/eportal/index\.jsp\?[^'"]+)['"]`,
+)
+
+// extractPortalURL 从锐捷网关拦截响应的正文中提取 ePortal 登录 URL。
+func extractPortalURL(body string) (*url.URL, error) {
+	match := portalURLPattern.FindStringSubmatch(body)
+	if len(match) < 2 {
+		return nil, errors.New("未找到锐捷 ePortal URL")
+	}
+
+	/*
+		URL 中的 & 等字符可能被 HTML 实体编码，
+		例如 &amp; 需要先还原成 &，否则 query 会解析错误。
+	*/
+	raw := html.UnescapeString(match[1])
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 ePortal URL 失败: %w", err)
+	}
+
+	if parsed.RawQuery == "" {
+		return nil, errors.New("ePortal URL 中没有 query 参数")
+	}
+
+	return parsed, nil
+}
+
+// DiscoverPortal 请求参数探测地址，从锐捷网关的拦截响应中提取登录参数。
 func (c *Client) DiscoverPortal(ctx context.Context) (string, string, error) {
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
-		"http://www.msftconnecttest.com/redirect",
+		portalProbeURL,
 		nil,
 	)
 	if err != nil {
@@ -91,40 +137,18 @@ func (c *Client) DiscoverPortal(ctx context.Context) (string, string, error) {
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("访问连通性检测地址失败: %w", err)
+		return "", "", fmt.Errorf("请求参数探测地址失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
-		return "", "", fmt.Errorf("读取 Portal 响应失败: %w", err)
+		return "", "", fmt.Errorf("读取参数探测响应失败: %w", err)
 	}
 
-	text := string(body)
-
-	/*
-		典型锐捷返回：
-
-		<script>
-		location.href='http://172.16.32.240/eportal/index.jsp?...'
-		</script>
-	*/
-	re := regexp.MustCompile(`(?i)(?:location\.href\s*=\s*['"])(https?://[^'"]+/eportal/index\.jsp\?[^'"]+)`)
-
-	match := re.FindStringSubmatch(text)
-	if len(match) < 2 {
-		return "", "", errors.New("没有从响应中找到锐捷 ePortal 登录地址")
-	}
-
-	indexURL := match[1]
-
-	parsed, err := url.Parse(indexURL)
+	parsed, err := extractPortalURL(string(body))
 	if err != nil {
-		return "", "", fmt.Errorf("解析 Portal URL 失败: %w", err)
-	}
-
-	if parsed.RawQuery == "" {
-		return "", "", errors.New("Portal URL 中没有 query 参数")
+		return "", "", err
 	}
 
 	/*
@@ -137,7 +161,7 @@ func (c *Client) DiscoverPortal(ctx context.Context) (string, string, error) {
 	*/
 	queryString := url.QueryEscape(parsed.RawQuery)
 
-	return indexURL, queryString, nil
+	return parsed.String(), queryString, nil
 }
 
 // GetCurrentSession 获取当前 Portal 会话。
@@ -301,4 +325,65 @@ func (c *Client) CheckInternet(ctx context.Context) bool {
 	}
 
 	return strings.Contains(string(body), "Success")
+}
+
+type logoutResponse struct {
+	Result  string `json:"result"`
+	Message string `json:"message"`
+}
+
+// Logout 注销当前锐捷登录账号。
+// 先获取当前会话的 userIndex，再调用 logout 接口。
+func (c *Client) Logout(ctx context.Context) error {
+	userIndex, err := c.GetCurrentSession(ctx)
+	if err != nil {
+		return fmt.Errorf("获取当前登录会话失败: %w", err)
+	}
+
+	target := c.PortalBase() + "/eportal/InterFace.do?method=logout"
+
+	form := url.Values{}
+	form.Set("userIndex", userIndex)
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		target,
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return fmt.Errorf("创建注销请求失败: %w", err)
+	}
+
+	req.Header.Set(
+		"Content-Type",
+		"application/x-www-form-urlencoded; charset=UTF-8",
+	)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("发送注销请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return fmt.Errorf("读取注销响应失败: %w", err)
+	}
+
+	var result logoutResponse
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf(
+			"解析注销响应失败: %w\n响应: %s",
+			err,
+			string(body),
+		)
+	}
+
+	if result.Result != "success" {
+		return fmt.Errorf("锐捷返回注销失败: %s", result.Message)
+	}
+
+	return nil
 }

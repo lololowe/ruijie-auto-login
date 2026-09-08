@@ -1,2 +1,4 @@
-*.exe
 config.json
+*.exe
+ruijie-autologin-android
+ruijie-autologin-ish

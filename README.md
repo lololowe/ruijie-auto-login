@@ -18,26 +18,29 @@
 - 网络断开后自动重新认证
 - 当前账号认证失败后自动尝试下一个账号
 - 所有账号均失败后自动等待并重新尝试
-- 独立的注销工具
+- 支持 `--status`、`--logout`、`--once`、`--help` 命令行参数
 - 配置文件修改账号后无需重新编译
 
 ## 工作原理
 
 本项目针对锐捷 ePortal Web 认证流程实现。
 
-未认证状态下，访问：
+未认证状态下，程序请求参数探测地址：
 
 ```text
-http://www.msftconnecttest.com/redirect
+http://119.29.29.29/
 ```
 
-锐捷网关会将请求重定向到类似：
+锐捷网关会拦截该 HTTP 请求，并在响应正文中返回类似：
 
-```text
-http://172.16.32.240/eportal/index.jsp?wlanuserip=...&wlanacname=...&mac=...
+```html
+<script>
+  top.self.location.href =
+    "http://172.16.32.240/eportal/index.jsp?wlanuserip=...&wlanacname=...&mac=...";
+</script>
 ```
 
-程序从这个地址中提取当前网络环境对应的动态参数，然后调用：
+程序从响应正文中提取完整的 ePortal 登录 URL，解析其 query 作为登录参数，然后调用：
 
 ```text
 POST /eportal/InterFace.do?method=login
@@ -159,14 +162,12 @@ ruijie-auto-login/
 │   └── ruijie/
 │       ├── config.go
 │       ├── portal.go
+│       ├── portal_test.go
 │       ├── auth.go
 │       └── monitor.go
 │
 └── cmd/
-    ├── autologin/
-    │   └── main.go
-    │
-    └── logout/
+    └── autologin/
         └── main.go
 ```
 
@@ -187,6 +188,7 @@ ruijie-auto-login/
 - 获取当前 `userIndex`
 - 查询当前登录用户
 - 检测互联网连接状态
+- 注销当前登录
 
 ### `internal/ruijie/auth.go`
 
@@ -207,11 +209,7 @@ ruijie-auto-login/
 
 ### `cmd/autologin/main.go`
 
-自动登录主程序入口。
-
-### `cmd/logout/main.go`
-
-独立注销程序，不参与自动登录主程序。
+自动登录主程序入口，支持 `--status`、`--logout`、`--once`、`--help` 参数。
 
 ## 配置
 
@@ -260,49 +258,108 @@ ruijie-auto-login/
 go mod tidy
 ```
 
-编译自动登录程序：
+项目只使用 Go 标准库，交叉编译不需要任何额外工具链。以下命令在 Windows PowerShell 中执行（Linux/macOS 下把 `$env:XXX="yyy"` 换成 `export XXX=yyy` 即可）。
 
-```bash
-go build -o ruijie-autologin ./cmd/autologin
+### Windows（amd64）
+
+```powershell
+$env:GOOS="windows"; $env:GOARCH="amd64"; go build -o ruijie-autologin.exe ./cmd/autologin
 ```
 
-编译注销程序：
-
-```bash
-go build -o ruijie-logout ./cmd/logout
-```
-
-Windows 下生成：
+生成：
 
 ```text
 ruijie-autologin.exe
-ruijie-logout.exe
 ```
+
+### Android / Termux / NetHunter（aarch64）
+
+对应 `uname -a` 显示 `aarch64` 的 Android 环境，统一使用 `GOOS=linux`：
+
+```powershell
+$env:GOOS="linux"; $env:GOARCH="arm64"; $env:CGO_ENABLED="0"; go build -o ruijie-autologin-android ./cmd/autologin
+```
+
+生成的 `ruijie-autologin-android` 传入手机后：
+
+```bash
+chmod +x ruijie-autologin-android
+./ruijie-autologin-android --once
+```
+
+注意：不要使用 `GOOS=android`。它会把 ELF 解释器设为 `/system/bin/linker64`，在 Termux 中可以直接运行，但在 NetHunter 等 chroot 环境里看不到 `/system`，执行时会报 `没有那个文件或目录`。`GOOS=linux` 编译出的是静态链接二进制，Termux 和 NetHunter chroot 都能直接运行。
+
+### iOS / iSH（i686）
+
+iSH 是 iOS 上的 i686（x86 32 位）Linux 模拟环境，对应 `uname -a` 显示 `i686 Linux`，因此使用 `GOOS=linux GOARCH=386`：
+
+```powershell
+$env:GOOS="linux"; $env:GOARCH="386"; $env:CGO_ENABLED="0"; go build -o ruijie-autologin-ish ./cmd/autologin
+```
+
+生成的 `ruijie-autologin-ish` 传入 iSH 后：
+
+```bash
+chmod +x ruijie-autologin-ish
+./ruijie-autologin-ish --once
+```
+
+iSH 不适合长期后台运行，建议使用 `--once` 配合 iOS 快捷指令完成单次认证。
 
 ## 运行
 
-### 自动登录
+### 命令行参数
+
+```text
+Usage:
+  autologin [options]
+
+不带参数时：
+  持续监控在线状态，掉线后自动重新登录
+
+Options:
+  --status    查询当前在线状态
+  --logout    注销当前登录
+  --once      单次检查并登录，成功后退出
+  --help      显示帮助
+```
+
+### 默认模式（持续监控）
 
 ```bash
 ruijie-autologin.exe
 ```
+
+持续检查校园网在线状态，检测到掉线后自动按账号轮询策略重新登录。
+
+### 查询状态
+
+```bash
+ruijie-autologin.exe --status
+```
+
+只查询当前认证状态并输出在线/离线结果，不进行登录，查询完成后立即退出。
+
+### 注销
+
+```bash
+ruijie-autologin.exe --logout
+```
+
+注销当前锐捷登录账号后退出，不进入监控，不自动重新登录。
+
+### 单次认证（iOS / iSH 场景）
+
+```bash
+ruijie-autologin.exe --once
+```
+
+检查状态 → 已在线则直接退出；离线则获取登录参数、按账号轮询策略登录、验证成功后立即退出。不进入持续监控，适合在 iSH 中由快捷指令启动。所有账号都失败时返回非 0 退出码。
 
 开发阶段也可以直接：
 
 ```bash
 go run ./cmd/autologin
-```
-
-### 注销
-
-```bash
-ruijie-logout.exe
-```
-
-或者：
-
-```bash
-go run ./cmd/logout
 ```
 
 ## 当前登录用户检测
@@ -345,7 +402,7 @@ MAC: ec4255cc00c1
 
 ## 注销原理
 
-注销工具首先获取当前会话：
+`--logout` 首先获取当前会话：
 
 ```text
 GET /eportal/redirectortosuccess.jsp
@@ -434,7 +491,7 @@ POST /eportal/InterFace.do?method=logout
 认证流程中的动态参数来自：
 
 ```text
-http://www.msftconnecttest.com/redirect
+http://119.29.29.29/
 ```
 
 ## 当前状态
@@ -449,7 +506,7 @@ http://www.msftconnecttest.com/redirect
 - 多账号顺序轮询
 - 启动随机轮询起点
 - 掉线重新认证
-- 独立注销
+- `--logout` 注销当前登录
 
 后续可以继续扩展：
 
