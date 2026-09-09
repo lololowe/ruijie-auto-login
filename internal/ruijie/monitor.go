@@ -197,10 +197,9 @@ func (m *Manager) Monitor(ctx context.Context) {
 
 		case <-ticker.C:
 			/*
-				Portal 状态查询：GetCurrentUser 内部会为“会话查询”和
-				“用户信息查询”分别创建独立的超时上下文。
+				Portal 状态查询：GetCurrentUser 内部会创建独立的超时上下文。
 				这里直接传入长生命周期的 ctx，不再额外包一层超时，
-				确保每个请求都能拿到完整的超时预算，
+				确保请求能拿到完整的超时预算，
 				也避免与后面的互联网检测共享同一个上下文。
 			*/
 			user, state, queryErr := m.Client.GetCurrentUser(ctx)
@@ -365,6 +364,7 @@ func (m *Manager) Monitor(ctx context.Context) {
 						offlineConfirmThreshold,
 						internetText(internetOK),
 					)
+					lastState = state
 					continue
 				}
 

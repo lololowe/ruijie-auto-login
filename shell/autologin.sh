@@ -41,6 +41,7 @@ COOKIE_FILE="${TMPDIR:-/tmp}/ruijie_autologin.$$"
 SLEEP_PID=""
 
 # 在线用户信息（get_online_user_info 填充）
+INFO_USER_INDEX=""
 INFO_RESULT=""
 INFO_MESSAGE=""
 INFO_USER_ID=""
@@ -308,100 +309,29 @@ discover_login_params() {
 
 # ---------------- 在线状态检测 ----------------
 
-# 获取本机出口 IP（等价于 Go 版本的 UDP dial 技巧）
-# 成功时输出 IP 并返回 0；失败时返回 1
-get_local_ip() {
-    # 直接解析路由表拿默认网关所在网卡会引入平台差异，
-    # 这里沿用 Go 版思路：UDP connect 只做路由选择、不真正发包，
-    # LocalAddr 即为本机出口 IP。实现上用 nc/自己都不好办，
-    # 改用解析路由表的通用做法会有兼容性问题，因此退化为：
-    # 依次尝试常见平台的方式，全部失败时返回空（调用方回退无参数查询）。
-    ip=$(ip -4 route get 1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
-    if [ -n "$ip" ]; then
-        printf '%s' "$ip"
-        return 0
-    fi
-
-    ip=$(route -n get 1 2>/dev/null | sed -n 's/.*interface: //p' | head -n 1)
-    if [ -n "$ip" ]; then
-        # macOS: 先拿接口名再取 IP
-        ip=$(ifconfig "$ip" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n 1)
-        if [ -n "$ip" ]; then
-            printf '%s' "$ip"
-            return 0
-        fi
-    fi
-
-    # BusyBox/Termux 环境：ifconfig 直接输出 inet 地址
-    ip=$(ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '127.0.0.1' | head -n 1)
-    if [ -z "$ip" ]; then
-        ip=$(ifconfig 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '127.0.0.1' | head -n 1)
-    fi
-
-    if [ -n "$ip" ]; then
-        printf '%s' "$ip"
-        return 0
-    fi
-
-    return 1
-}
-
-# 获取当前 Portal 会话的 userIndex
-# 成功时输出 userIndex 并返回 0
-#
-# 实测（与 Go 版本一致）：这台 ePortal 的 redirectortosuccess.jsp
-# 无参数请求时无法定位会话，即使在线也只返回空跳转 Location: http:// ，
-# 必须携带 ?wlanuserip=<本机出口IP> 才能查到会话；
-# 获取不到出口 IP 时回退为无参数请求（兼容其他锐捷部署）。
-get_current_session() {
-    session_url="$PORTAL_BASE/eportal/redirectortosuccess.jsp"
-
-    if wlan_ip=$(get_local_ip); then
-        session_url="$session_url?wlanuserip=$(urlencode "$wlan_ip")"
-    fi
-
-    headers=$(curl -s \
-        --connect-timeout "$REQUEST_TIMEOUT" \
-        --max-time "$REQUEST_TIMEOUT" \
-        -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
-        -o /dev/null -D - \
-        "$session_url" 2>/dev/null) || return 1
-
-    location=$(printf '%s\n' "$headers" | grep -i '^Location:' | head -n 1 | tr -d '\r')
-    location=${location#*:}
-    # 去掉前导空白
-    location=$(printf '%s' "$location" | sed 's/^[[:space:]]*//')
-
-    # 请求成功但没有 Location：视为查询失败（UNKNOWN），交由调用方判断
-    if [ -z "$location" ]; then
-        return 1
-    fi
-
-    # Location 是空地址（http://）或登录页跳转（无 userIndex），
-    # 都是“明确没有登录会话”的确定性信号
-    case "$location" in
-        *userIndex=*) ;;
-        *) return 2 ;;
-    esac
-
-    user_index=$(printf '%s' "$location" | sed -n 's/.*[?&]userIndex=\([^&]*\).*/\1/p')
-    if [ -z "$user_index" ]; then
-        return 2
-    fi
-
-    printf '%s' "$user_index"
-    return 0
-}
-
 # 查询在线用户信息，结果写入 INFO_* 全局变量
+#
+# 实测（抓包验证）：userIndex 传空时服务器按来源 IP 自动定位会话，
+# 这正是浏览器门户页的行为（请求体仅为 "userIndex="）：
+#
+#	在线 → {"userIndex":"...","result":"success","userId":"...","userIp":"..."}
+#	离线 → {"userIndex":null,"result":"fail","userId":null,"userIp":null}
+#
+# 在线响应中自带 userIndex，do_logout 直接复用。
+#
+# 旧方案依赖 redirectortosuccess.jsp 的 302 Location 提取 userIndex，
+# 但部分网关即使在线也只返回空 Location，导致在线被误判为离线，
+# 已彻底弃用。
 get_online_user_info() {
     user_index=$1
 
+    # 实测：POST 在部分锐捷网关会超时，GET 正常（curl 验证）
+    # -G 使 curl 用 GET 方式，--data-urlencode 的参数附加到 URL query
     resp=$(curl -s \
         --connect-timeout "$REQUEST_TIMEOUT" \
         --max-time "$REQUEST_TIMEOUT" \
         -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
-        -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+        -G \
         --data-urlencode "userIndex=$user_index" \
         "$PORTAL_BASE/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null) || return 1
 
@@ -409,6 +339,7 @@ get_online_user_info() {
         return 1
     fi
 
+    INFO_USER_INDEX=$(json_get "$resp" "userIndex")
     INFO_RESULT=$(json_get "$resp" "result")
     INFO_MESSAGE=$(json_get "$resp" "message")
     INFO_USER_ID=$(json_get "$resp" "userId")
@@ -424,29 +355,22 @@ get_online_user_info() {
 # 返回 0 = 在线(ONLINE), 1 = 离线(OFFLINE), 2 = 未知(UNKNOWN)
 #
 # 三态判定（与 Go 版本一致）：
-#   - OFFLINE 只来自 Portal 的“明确否定”（登录页跳转/空地址），
-#     网络失败、超时等一律是 UNKNOWN，绝不猜测为离线
-#   - 注意: result=wait 也可能带完整 userId/userIp，所以按 userId + userIp 判断
+#   - ONLINE:  userId + userIp 非空（result=wait 也可能带完整信息，照样算在线）
+#   - OFFLINE: 服务器明确返回 result=fail（用户已下线）
+#   - UNKNOWN: 网络失败、超时、信息不完整，绝不猜测为离线
 check_status() {
-    user_index=$(get_current_session)
-    st=$?
-
-    if [ "$st" -eq 2 ]; then
-        # Portal 明确表示没有登录会话
-        return 1
-    fi
-
-    if [ "$st" -ne 0 ] || [ -z "$user_index" ]; then
+    if ! get_online_user_info ""; then
         # 请求失败/超时：状态未知
-        return 2
-    fi
-
-    if ! get_online_user_info "$user_index"; then
         return 2
     fi
 
     if [ -n "$INFO_USER_ID" ] && [ -n "$INFO_USER_IP" ]; then
         return 0
+    fi
+
+    # 服务器明确回答“用户已下线”，这是确定性离线信号
+    if [ "$INFO_RESULT" = "fail" ]; then
+        return 1
     fi
 
     # 信息不完整：只能算未知，不能当成未登录
@@ -570,19 +494,20 @@ login_cycle() {
 }
 
 # 注销当前登录（独立逻辑，不与自动登录循环耦合）
+# 先以空 userIndex 查询在线用户（服务器按来源 IP 定位会话），
+# 从响应中取出 userIndex，再调用 logout 接口。
 do_logout() {
-    user_index=$(get_current_session)
-    session_st=$?
-
-    if [ "$session_st" -eq 2 ]; then
-        printf '注销失败: 当前没有登录会话（无需注销）\n'
-        return 1
-    fi
-
-    if [ "$session_st" -ne 0 ]; then
+    if ! get_online_user_info ""; then
         printf '注销失败: 获取当前登录会话失败（网络错误或超时）\n'
         return 1
     fi
+
+    if [ -z "$INFO_USER_INDEX" ]; then
+        printf '注销失败: 当前没有登录会话（可能已经下线）\n'
+        return 1
+    fi
+
+    user_index=$INFO_USER_INDEX
 
     resp=$(curl -s \
         --connect-timeout "$REQUEST_TIMEOUT" \
@@ -789,6 +714,7 @@ monitor() {
                 if [ "$offline_count" -lt "$OFFLINE_THRESHOLD" ]; then
                     printf '[%s] 当前状态: OFFLINE | 连续确认: %d/%d | 互联网: %s | 尚未确认掉线，等待下一轮检测\n' \
                         "$(timestamp)" "$offline_count" "$OFFLINE_THRESHOLD" "$(internet_text "$internet_st")"
+                    last_state=$state
                     continue
                 fi
 

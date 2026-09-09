@@ -73,13 +73,13 @@ passwordEncrypt
 }
 ```
 
-随后程序可以通过：
+随后程序通过：
 
 ```text
-POST /eportal/InterFace.do?method=getOnlineUserInfo
+GET /eportal/InterFace.do?method=getOnlineUserInfo&userIndex=
 ```
 
-查询当前认证用户。
+查询当前认证用户（`userIndex` 为空时服务器按来源 IP 自动定位会话）。
 
 ## 登录流程
 
@@ -199,8 +199,7 @@ ruijie-auto-login/
 
 - 自动发现 ePortal
 - 获取动态 `queryString`
-- 获取当前 `userIndex`
-- 查询当前登录用户
+- 查询当前在线用户（`getOnlineUserInfo`，GET 请求）
 - 检测互联网连接状态
 - 注销当前登录
 
@@ -422,9 +421,9 @@ chmod +x shell/autologin.sh
 Shell 版本与 Go 版本使用完全相同的锐捷认证流程和监控状态机：
 
 - 通过 `http://119.29.29.29/` 发现 ePortal 登录参数
-- `redirectortosuccess.jsp?wlanuserip=<本机IP>` 查询会话（通过 `ip route` / `ifconfig` 获取出口 IP）
+- `GET /eportal/InterFace.do?method=getOnlineUserInfo` 查询在线状态（空 `userIndex`，服务器按来源 IP 定位）
 - `POST /eportal/InterFace.do?method=login` 登录
-- `getOnlineUserInfo` 验证在线（`result=wait` 但带 `userId`/`userIp` 也视为在线）
+- `result=wait` 但带 `userId`/`userIp` 也视为在线
 - 随机账号起点 + 顺序轮询
 - **三态状态机**（`check_status` 返回 0=在线 / 1=离线 / 2=未知）
 - **连续 3 次 OFFLINE 才确认掉线**，互联网检测（Apple success.html）只记日志不触发重登
@@ -432,25 +431,29 @@ Shell 版本与 Go 版本使用完全相同的锐捷认证流程和监控状态�
 
 ## 当前登录用户检测
 
-程序启动时会调用：
+程序启动时直接以空 `userIndex` 调用：
 
 ```text
-/eportal/redirectortosuccess.jsp?wlanuserip=<本机出口IP>
+GET /eportal/InterFace.do?method=getOnlineUserInfo&userIndex=
 ```
 
-获取当前认证会话的 `userIndex`，然后调用：
+服务器按来源 IP 自动定位会话，返回当前认证用户信息：
 
 ```text
-/eportal/InterFace.do?method=getOnlineUserInfo
+在线 → {"userIndex":"...","result":"success","userId":"...","userIp":"..."}
+离线 → {"userIndex":null,"result":"fail","userId":null,"userIp":null}
 ```
 
-获取用户信息。
+在线响应中自带 `userIndex`，注销时直接复用。
 
-> **实测说明**（2026-09-09，湖南工业大学 ePortal）：
-> 部分锐捷 ePortal 的 `redirectortosuccess.jsp` 无参数请求时无法定位会话，
-> 即使已经在线也只返回空跳转 `Location: http://`，导致误判离线；
-> 必须携带 `wlanuserip`（本机出口 IP，Go 版用 UDP dial 获取，Shell 版解析路由表）才能查到会话。
-> 程序已内置该处理，无需配置。
+> **实测说明**：
+> 最初使用 `redirectortosuccess.jsp` 的 302 跳转提取 `userIndex`，
+> 但部分网关即使在线也只返回空 `Location: http://`，导致在线被误判为离线。
+> 旧方案已彻底弃用，改为直接调用 `getOnlineUserInfo`（GET），服务器按来源 IP 定位会话，
+> 与浏览器门户页的行为一致。
+
+另外，最初使用 POST 提交 `userIndex`，但部分锐捷网关对 POST 请求超时
+（`context deadline exceeded`），同一地址改用 GET 后正常返回，因此改为 GET。
 
 例如：
 
@@ -480,8 +483,8 @@ MAC: ec4255cc00c1
 
 | 状态      | 含义       | 判定依据                                                                |
 | --------- | ---------- | ----------------------------------------------------------------------- |
-| `ONLINE`  | 明确在线   | 会话查询跳转带 `userIndex`，且 `userId` + `userIp` 完整                 |
-| `OFFLINE` | 明确未登录 | 会话查询跳转到登录页 / 空地址（无 `userIndex`），是 Portal 的"明确否定" |
+| `ONLINE`  | 明确在线   | `getOnlineUserInfo` 返回 `userId` + `userIp` 完整                      |
+| `OFFLINE` | 明确未登录 | `getOnlineUserInfo` 返回 `result=fail`，`userId`/`userIp` 为空         |
 | `UNKNOWN` | 无法确定   | 查询超时、网络失败、信息不完整等一切"没问明白"的情况                    |
 
 核心原则：
@@ -515,19 +518,13 @@ MAC: ec4255cc00c1
 
 ## 注销原理
 
-`--logout` 首先获取当前会话：
+`--logout` 先以空 `userIndex` 调用：
 
 ```text
-GET /eportal/redirectortosuccess.jsp?wlanuserip=<本机出口IP>
+GET /eportal/InterFace.do?method=getOnlineUserInfo&userIndex=
 ```
 
-得到：
-
-```text
-success.jsp?userIndex=...
-```
-
-然后调用：
+服务器按来源 IP 定位会话，在线响应中自带 `userIndex`，然后调用：
 
 ```text
 POST /eportal/InterFace.do?method=logout
@@ -539,7 +536,7 @@ POST /eportal/InterFace.do?method=logout
 userIndex=...
 ```
 
-注销不需要账号密码。
+注销不需要账号密码。实测响应：`{"result":"success","message":"下线成功！"}`
 
 ## 网络监控
 
@@ -594,14 +591,15 @@ config.json
 当前实现基于实际抓包验证的 ePortal 接口：
 
 ```text
-GET  /eportal/redirectortosuccess.jsp?wlanuserip=<本机出口IP>
-
-POST /eportal/InterFace.do?method=getOnlineUserInfo
+GET  /eportal/InterFace.do?method=getOnlineUserInfo
 
 POST /eportal/InterFace.do?method=login
 
 POST /eportal/InterFace.do?method=logout
 ```
+
+> `redirectortosuccess.jsp` 曾用于提取 `userIndex`，但部分网关对该接口返回异常
+> （即使在线也返回空 Location），已彻底弃用。
 
 认证流程中的动态参数来自：
 
@@ -617,12 +615,14 @@ http://119.29.29.29/
 - 动态 `queryString` 获取
 - HTTP 直接登录
 - 登录成功状态确认
-- 当前登录用户检测
+- 当前登录用户检测（`getOnlineUserInfo` GET 请求，空 `userIndex` 按来源 IP 定位）
 - 多账号顺序轮询
 - 启动随机轮询起点
 - 掉线重新认证（三态状态机 + 连续 3 次确认）
 - `--logout` 注销当前登录
-- 浏览器完整认证流程抓包比对（2026-09-09）：登录/注销表单字段、`passwordEncrypt=false`、`keepaliveInterval=0`（无需客户端保活）均与程序实现一致
+- 浏览器完整认证流程抓包比对：登录/注销表单字段、`passwordEncrypt=false`、`keepaliveInterval=0`（无需客户端保活）均与程序实现一致
+- `getOnlineUserInfo` 由 POST 改为 GET（部分网关 POST 超时，GET 正常）
+- 监控状态机 `lastState` 修复（掉线确认期间状态变化横幅不再重复打印）
 
 后续可以继续扩展：
 

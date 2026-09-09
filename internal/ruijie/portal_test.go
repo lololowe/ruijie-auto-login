@@ -135,21 +135,27 @@ func newTestClient(t *testing.T, mux *http.ServeMux) *Client {
 	return client
 }
 
-// TestGetCurrentUserOfflineByRedirectWithoutUserIndex
-// 实测：注销后 redirectortosuccess.jsp 仍返回 302，
-// 但 Location 指向登录页（无 userIndex 参数），必须判定为 OFFLINE。
-// 之前把它当成查询异常返回 UNKNOWN，导致程序永远卡在"状态未知、不登录"。
-func TestGetCurrentUserOfflineByRedirectWithoutUserIndex(t *testing.T) {
+// TestGetCurrentUserOffline
+// 实测：离线时 getOnlineUserInfo 以空 userIndex 查询，
+// 服务器按来源 IP 找不到会话，明确返回 result=fail 且 userId/userIp 为 null。
+// 这必须判定为 OFFLINE。
+func TestGetCurrentUserOffline(t *testing.T) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(
-		"/eportal/redirectortosuccess.jsp",
+		"/eportal/InterFace.do",
 		func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(
+			if r.URL.Query().Get("method") != "getOnlineUserInfo" {
+				http.NotFound(w, r)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(
 				w,
-				r,
-				"/eportal/index.jsp?wlanuserip=172.28.130.45&wlanacname=AC01",
-				http.StatusFound,
+				`{"userIndex":null,"result":"fail",`+
+					`"message":"获取用户信息失败，用户可能已经下线",`+
+					`"userId":null,"userIp":null}`,
 			)
 		},
 	)
@@ -159,7 +165,7 @@ func TestGetCurrentUserOfflineByRedirectWithoutUserIndex(t *testing.T) {
 	user, state, err := client.GetCurrentUser(context.Background())
 
 	if state != PortalOffline {
-		t.Errorf("state = %v, 期望 OFFLINE（Location 无 userIndex 是明确未登录信号）", state)
+		t.Errorf("state = %v, 期望 OFFLINE（result=fail 是明确未登录信号）", state)
 	}
 
 	if user != nil {
@@ -172,54 +178,24 @@ func TestGetCurrentUserOfflineByRedirectWithoutUserIndex(t *testing.T) {
 	}
 }
 
-// TestGetCurrentUserOfflineByNoLocation
-// 未登录的另一种形态：响应不带 Location 头，也必须判定为 OFFLINE。
-func TestGetCurrentUserOfflineByNoLocation(t *testing.T) {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc(
-		"/eportal/redirectortosuccess.jsp",
-		func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		},
-	)
-
-	client := newTestClient(t, mux)
-
-	_, state, err := client.GetCurrentUser(context.Background())
-
-	if state != PortalOffline {
-		t.Errorf("state = %v, 期望 OFFLINE（无 Location 是明确未登录信号）", state)
-	}
-
-	if err != nil {
-		t.Errorf("OFFLINE 时 err 应为 nil, got %v", err)
-	}
-}
-
 // TestGetCurrentUserOnline 验证在线时返回 ONLINE 及完整用户信息。
+// 实测：在线响应自带 userIndex（logout 复用），必须正确提取到 UserInfo。
 func TestGetCurrentUserOnline(t *testing.T) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(
-		"/eportal/redirectortosuccess.jsp",
-		func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(
-				w,
-				r,
-				"/eportal/success.jsp?userIndex=idx-test-123",
-				http.StatusFound,
-			)
-		},
-	)
-
-	mux.HandleFunc(
 		"/eportal/InterFace.do",
 		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("method") != "getOnlineUserInfo" {
+				http.NotFound(w, r)
+				return
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(
 				w,
-				`{"result":"success","userId":"24412030205","userName":"test",`+
+				`{"userIndex":"idx-from-response","result":"success",`+
+					`"userId":"24412030205","userName":"test",`+
 					`"userIp":"172.28.130.45","userMac":"fed29afd7067"}`,
 			)
 		},
@@ -238,6 +214,52 @@ func TestGetCurrentUserOnline(t *testing.T) {
 	}
 
 	if user == nil || user.UserID != "24412030205" || user.UserIP != "172.28.130.45" {
+		t.Fatalf("用户信息不完整, got %+v", user)
+	}
+
+	// userIndex 来自响应体，供 logout 使用。
+	if user.UserIndex != "idx-from-response" {
+		t.Errorf("UserIndex = %q, 期望 idx-from-response", user.UserIndex)
+	}
+}
+
+// TestGetCurrentUserOnlineWithWaitResult
+// 实测（抓包验证）：登录后瞬间查询可能返回 result=wait，
+// 但已带完整 userId/userIp，必须判定为 ONLINE。
+func TestGetCurrentUserOnlineWithWaitResult(t *testing.T) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc(
+		"/eportal/InterFace.do",
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("method") != "getOnlineUserInfo" {
+				http.NotFound(w, r)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(
+				w,
+				`{"userIndex":"idx-wait","result":"wait",`+
+					`"message":"用户信息不完整，请稍后重试",`+
+					`"userId":"21412080406","userIp":"172.28.130.45"}`,
+			)
+		},
+	)
+
+	client := newTestClient(t, mux)
+
+	user, state, err := client.GetCurrentUser(context.Background())
+
+	if err != nil {
+		t.Fatalf("查询不应返回错误: %v", err)
+	}
+
+	if state != PortalOnline {
+		t.Errorf("state = %v, 期望 ONLINE（result=wait 但 userId/userIp 完整）", state)
+	}
+
+	if user == nil || user.UserID != "21412080406" {
 		t.Errorf("用户信息不完整, got %+v", user)
 	}
 }
@@ -248,22 +270,15 @@ func TestGetCurrentUserIncompleteUserInfo(t *testing.T) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(
-		"/eportal/redirectortosuccess.jsp",
-		func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(
-				w,
-				r,
-				"/eportal/success.jsp?userIndex=idx-test-123",
-				http.StatusFound,
-			)
-		},
-	)
-
-	mux.HandleFunc(
 		"/eportal/InterFace.do",
 		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("method") != "getOnlineUserInfo" {
+				http.NotFound(w, r)
+				return
+			}
+
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"result":"wait","message":"用户信息不完整，请稍后重试"}`)
+			fmt.Fprint(w, `{"userIndex":null,"result":"wait","message":"用户信息不完整，请稍后重试"}`)
 		},
 	)
 
@@ -280,83 +295,76 @@ func TestGetCurrentUserIncompleteUserInfo(t *testing.T) {
 	}
 }
 
-// TestQuerySessionWithWlanuserip
-// 实测：ePortal 要求 redirectortosuccess.jsp 携带 wlanuserip 参数才能定位会话。
-// 验证 querySession 会把 wlanuserip 正确拼进查询串。
-func TestQuerySessionWithWlanuserip(t *testing.T) {
-	var gotParam string
+// TestLogoutUsesUserIndexFromOnlineUserInfo
+// 验证 Logout 从 getOnlineUserInfo 响应中提取 userIndex 并提交给 logout 接口。
+// 实测：该流程在真实 ePortal 上返回 {"result":"success","message":"下线成功！"}。
+func TestLogoutUsesUserIndexFromOnlineUserInfo(t *testing.T) {
+	var gotUserIndex string
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(
-		"/eportal/redirectortosuccess.jsp",
+		"/eportal/InterFace.do",
 		func(w http.ResponseWriter, r *http.Request) {
-			gotParam = r.URL.Query().Get("wlanuserip")
+			switch r.URL.Query().Get("method") {
+			case "getOnlineUserInfo":
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(
+					w,
+					`{"userIndex":"idx-logout-1","result":"success",`+
+						`"userId":"24412030205","userIp":"172.28.130.45"}`,
+				)
+			case "logout":
+				if err := r.ParseForm(); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				gotUserIndex = r.PostFormValue("userIndex")
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"result":"success","message":"下线成功！"}`)
+			default:
+				http.NotFound(w, r)
+			}
+		},
+	)
 
-			http.Redirect(
+	client := newTestClient(t, mux)
+
+	if err := client.Logout(context.Background()); err != nil {
+		t.Fatalf("注销不应失败: %v", err)
+	}
+
+	if gotUserIndex != "idx-logout-1" {
+		t.Errorf("logout 提交的 userIndex = %q, 期望 idx-logout-1", gotUserIndex)
+	}
+}
+
+// TestLogoutWhenOffline
+// 离线时（result=fail，userIndex 为 null）注销应返回明确错误，而不是误报成功。
+func TestLogoutWhenOffline(t *testing.T) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc(
+		"/eportal/InterFace.do",
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("method") != "getOnlineUserInfo" {
+				http.NotFound(w, r)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(
 				w,
-				r,
-				"/eportal/./success.jsp?userIndex=idx-param-1",
-				http.StatusFound,
+				`{"userIndex":null,"result":"fail",`+
+					`"message":"获取用户信息失败，用户可能已经下线",`+
+					`"userId":null,"userIp":null}`,
 			)
 		},
 	)
 
 	client := newTestClient(t, mux)
 
-	// 模拟实测抓包：带 wlanuserip 时 ePortal 返回带 userIndex 的跳转。
-	idx, err := client.querySession(context.Background(), "172.28.130.45")
-
-	if err != nil {
-		t.Fatalf("带 wlanuserip 查询不应失败: %v", err)
-	}
-
-	if idx != "idx-param-1" {
-		t.Errorf("userIndex = %q, 期望 idx-param-1", idx)
-	}
-
-	if gotParam != "172.28.130.45" {
-		t.Errorf("服务端收到的 wlanuserip = %q, 期望 172.28.130.45", gotParam)
-	}
-}
-
-// TestLocationUserIndex 验证从 302 Location 提取 userIndex 的各种形态。
-func TestLocationUserIndex(t *testing.T) {
-	cases := []struct {
-		name     string
-		location string
-		want     string
-	}{
-		{
-			// 实测在线形态：带 userIndex 的 success 跳转（注意含 ./ 路径）。
-			name:     "success跳转带userIndex",
-			location: "http://172.16.32.240/eportal/./success.jsp?userIndex=abc123",
-			want:     "abc123",
-		},
-		{
-			// 实测无参数请求的空地址形态：解析成功但无 query。
-			name:     "空地址http://",
-			location: "http://",
-			want:     "",
-		},
-		{
-			name:     "空Location",
-			location: "",
-			want:     "",
-		},
-		{
-			// 实测未登录形态：跳登录页，无 userIndex。
-			name:     "登录页跳转",
-			location: "http://172.16.32.240/eportal/index.jsp?wlanuserip=172.28.130.45",
-			want:     "",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := locationUserIndex(tc.location); got != tc.want {
-				t.Errorf("locationUserIndex(%q) = %q, 期望 %q", tc.location, got, tc.want)
-			}
-		})
+	if err := client.Logout(context.Background()); err == nil {
+		t.Error("离线时注销应返回错误（当前没有登录会话）")
 	}
 }

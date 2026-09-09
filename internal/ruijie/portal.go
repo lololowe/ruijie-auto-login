@@ -41,11 +41,6 @@ func (s PortalState) String() string {
 	}
 }
 
-// ErrPortalNoSession 表示明确确认当前没有登录的 Portal 会话。
-// 仅用于“没有登录跳转地址”等确定性信号；
-// 网络失败、超时等错误不能包装成该错误，否则会被误判为离线。
-var ErrPortalNoSession = errors.New("当前没有登录的 Portal 会话")
-
 // isTimeoutErr 判断请求错误是否为超时（含 context deadline exceeded）。
 func isTimeoutErr(err error) bool {
 	var netErr net.Error
@@ -214,126 +209,47 @@ func (c *Client) DiscoverPortal(ctx context.Context) (string, string, error) {
 	return parsed.String(), queryString, nil
 }
 
-// localIP 通过 UDP dial 获取本机出口 IP。
-// UDP 是无连接的，Dial 只做路由选择、不会真正发包，
-// 因此可以安全地使用外部地址，且无需任何网络连通性。
-func localIP() string {
-	conn, err := net.Dial("udp", "119.29.29.29:80")
+// GetOnlineUserInfo 查询当前在线用户。
+//
+// 实测（抓包验证）：userIndex 传空时服务器按来源 IP 自动定位会话，
+// 这正是浏览器门户页的行为：
+//
+//	GET /eportal/InterFace.do?method=getOnlineUserInfo&userIndex=
+//
+//	在线 → {"userIndex":"...","result":"success","userId":"...","userIp":"..."}
+//	离线 → {"userIndex":null,"result":"fail","userId":null,"userIp":null,
+//	        "message":"获取用户信息失败，用户可能已经下线"}
+//
+// 在线响应中自带 userIndex，logout 可直接复用。
+//
+// 最初使用 POST 提交 userIndex，但部分锐捷网关对 POST 请求超时
+// （context deadline exceeded），同一地址改用 GET 后正常返回，
+// 因此改为 GET。
+//
+// 旧方案依赖 redirectortosuccess.jsp 的 302 Location 提取 userIndex，
+// 但部分网关即使在线也只返回空 Location，导致在线被误判为离线，
+// 已彻底弃用。
+func (c *Client) GetOnlineUserInfo(ctx context.Context, userIndex string) (*UserInfo, error) {
+	target := c.PortalBase() + "/eportal/InterFace.do?method=getOnlineUserInfo"
+
+	// userIndex 作为 query 参数附加到 URL，GET 请求无需请求体
+	u, err := url.Parse(target)
 	if err != nil {
-		return ""
+		return nil, err
 	}
-	defer conn.Close()
-
-	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-		return addr.IP.String()
-	}
-
-	return ""
-}
-
-// GetCurrentSession 获取当前 Portal 会话。
-//
-// 实测（2026-09-09，湖南工业大学 ePortal）：
-// 这台 ePortal 的 redirectortosuccess.jsp 无参数请求时无法定位会话，
-// 即使已经在线也只返回空跳转 Location: http:// ，导致误判 OFFLINE；
-// 必须携带 ?wlanuserip=<本机出口IP> 参数才能查到会话：
-//
-//	GET /eportal/redirectortosuccess.jsp?wlanuserip=172.28.130.45
-//	→ 302 Location: http://172.16.32.240/eportal/./success.jsp?userIndex=...
-//
-// 未登录时该接口返回登录页跳转（无 userIndex），是明确的离线信号。
-func (c *Client) GetCurrentSession(ctx context.Context) (string, error) {
-	// 优先携带 wlanuserip 参数查询；出口 IP 获取失败时回退为无参数查询。
-	if ip := localIP(); ip != "" {
-		return c.querySession(ctx, ip)
-	}
-
-	return c.querySession(ctx, "")
-}
-
-// querySession 请求 redirectortosuccess.jsp 并解析当前会话的 userIndex。
-// wlanUserIP 为空时表示无参数请求。
-func (c *Client) querySession(ctx context.Context, wlanUserIP string) (string, error) {
-	target := c.PortalBase() + "/eportal/redirectortosuccess.jsp"
-
-	if wlanUserIP != "" {
-		target += "?wlanuserip=" + url.QueryEscape(wlanUserIP)
-	}
-
-	client := *c.HTTP
-
-	// 这里必须禁止自动跟随 302，因为我们需要读取 Location。
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
+	q := u.Query()
+	q.Set("userIndex", userIndex)
+	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
-		target,
+		u.String(),
 		nil,
-	)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		// 网络失败/超时不能当成“没有登录”，调用方据此应判定 UNKNOWN。
-		if isTimeoutErr(err) {
-			return "", fmt.Errorf("Portal 状态查询超时: %w", err)
-		}
-		return "", fmt.Errorf("获取当前登录状态失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	/*
-		实测的两种明确“无会话”形态：
-		  1. Location 指向登录页（如 /eportal/index.jsp?wlanuserip=...），无 userIndex；
-		  2. Location 为空或空地址 http:// 。
-		请求本身成功却拿不到 userIndex，均视为明确未登录。
-	*/
-	userIndex := locationUserIndex(resp.Header.Get("Location"))
-	if userIndex == "" {
-		return "", ErrPortalNoSession
-	}
-
-	return userIndex, nil
-}
-
-// locationUserIndex 从 302 跳转地址中提取 userIndex 参数。
-// 地址为空、空地址（http://）、或不含 userIndex（如登录页）时返回空。
-func locationUserIndex(location string) string {
-	if location == "" {
-		return ""
-	}
-
-	parsed, err := url.Parse(location)
-	if err != nil {
-		return ""
-	}
-
-	return parsed.Query().Get("userIndex")
-}
-
-// GetOnlineUserInfo 查询当前在线用户。
-func (c *Client) GetOnlineUserInfo(ctx context.Context, userIndex string) (*UserInfo, error) {
-	target := c.PortalBase() + "/eportal/InterFace.do?method=getOnlineUserInfo"
-
-	form := url.Values{}
-	form.Set("userIndex", userIndex)
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		target,
-		strings.NewReader(form.Encode()),
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -352,8 +268,14 @@ func (c *Client) GetOnlineUserInfo(ctx context.Context, userIndex string) (*User
 		return nil, fmt.Errorf("解析用户信息失败: %w\n响应: %s", err, string(body))
 	}
 
+	// 在线时响应自带 userIndex；离线时为 null，回退到入参值
+	resolvedIndex := result.UserIndex
+	if resolvedIndex == "" {
+		resolvedIndex = userIndex
+	}
+
 	return &UserInfo{
-		UserIndex: userIndex,
+		UserIndex: resolvedIndex,
 		UserID:    result.UserID,
 		UserName:  result.UserName,
 		UserIP:    result.UserIP,
@@ -370,33 +292,20 @@ func (c *Client) GetOnlineUserInfo(ctx context.Context, userIndex string) (*User
 // GetCurrentUser 获取当前登录用户及三态登录状态。
 // 锐捷这里 result=wait 也可能已经带有完整 userId/userIp，所以不能只看 result。
 //
+// 直接以空 userIndex 调用 getOnlineUserInfo，服务器按来源 IP 定位会话，
+// 不依赖 redirectortosuccess.jsp（部分网关对该接口返回异常，曾导致在线被误判为离线）。
+//
 // 返回值语义：
 //   - PortalOnline:  明确在线，user 为在线用户信息
-//   - PortalOffline: 明确没有登录会话，err 为 nil
+//   - PortalOffline: 服务器明确返回 result=fail（用户已下线），err 为 nil
 //   - PortalUnknown: 查询失败、超时或信息不完整，err 说明原因
 //
 // 关键约束：网络请求失败绝不能返回 PortalOffline，错误也不能被吞掉。
 func (c *Client) GetCurrentUser(ctx context.Context) (*UserInfo, PortalState, error) {
 	perRequest := time.Duration(c.Config.RequestTimeout) * time.Second
 
-	/*
-		会话查询与用户信息查询各自使用独立的超时上下文，
-		避免前一个请求耗时吃掉后一个请求的超时预算。
-	*/
-	sessCtx, sessCancel := context.WithTimeout(ctx, perRequest)
-	userIndex, err := c.GetCurrentSession(sessCtx)
-	sessCancel()
-
-	if err != nil {
-		// 只有“明确没有登录会话”才是 OFFLINE，其余一律 UNKNOWN。
-		if errors.Is(err, ErrPortalNoSession) {
-			return nil, PortalOffline, nil
-		}
-		return nil, PortalUnknown, err
-	}
-
 	infoCtx, infoCancel := context.WithTimeout(ctx, perRequest)
-	info, err := c.GetOnlineUserInfo(infoCtx, userIndex)
+	info, err := c.GetOnlineUserInfo(infoCtx, "")
 	infoCancel()
 
 	if err != nil {
@@ -404,22 +313,20 @@ func (c *Client) GetCurrentUser(ctx context.Context) (*UserInfo, PortalState, er
 	}
 
 	/*
-		你的环境实际出现过：
-
-		result = wait
-		message = 用户信息不完整，请稍后重试
-
-		但同时已经有：
-
-		userId
-		userName
-		userIp
-		userMac
-
-		所以实际判断依据是 UserID + UserIP。
+		实际判断依据是 UserID + UserIP：
+		result = wait 也可能带完整 userId/userIp（已在生产环境观测到），
+		此时按在线处理。
 	*/
 	if info.UserID != "" && info.UserIP != "" {
 		return info, PortalOnline, nil
+	}
+
+	/*
+		服务器明确回答“用户已下线”（result=fail 且 userId/userIp 为空），
+		这是确定性离线信号。
+	*/
+	if info.Result == "fail" {
+		return nil, PortalOffline, nil
 	}
 
 	// 信息不完整只能算 UNKNOWN，不能当成未登录。
@@ -464,12 +371,19 @@ type logoutResponse struct {
 }
 
 // Logout 注销当前锐捷登录账号。
-// 先获取当前会话的 userIndex，再调用 logout 接口。
+// 先以空 userIndex 查询在线用户（服务器按来源 IP 定位会话），
+// 从响应中取出 userIndex，再调用 logout 接口。
 func (c *Client) Logout(ctx context.Context) error {
-	userIndex, err := c.GetCurrentSession(ctx)
+	info, err := c.GetOnlineUserInfo(ctx, "")
 	if err != nil {
 		return fmt.Errorf("获取当前登录会话失败: %w", err)
 	}
+
+	if info.UserIndex == "" {
+		return errors.New("当前没有登录的 Portal 会话（可能已经下线）")
+	}
+
+	userIndex := info.UserIndex
 
 	target := c.PortalBase() + "/eportal/InterFace.do?method=logout"
 
