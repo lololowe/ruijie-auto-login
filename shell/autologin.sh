@@ -308,33 +308,85 @@ discover_login_params() {
 
 # ---------------- 在线状态检测 ----------------
 
+# 获取本机出口 IP（等价于 Go 版本的 UDP dial 技巧）
+# 成功时输出 IP 并返回 0；失败时返回 1
+get_local_ip() {
+    # 直接解析路由表拿默认网关所在网卡会引入平台差异，
+    # 这里沿用 Go 版思路：UDP connect 只做路由选择、不真正发包，
+    # LocalAddr 即为本机出口 IP。实现上用 nc/自己都不好办，
+    # 改用解析路由表的通用做法会有兼容性问题，因此退化为：
+    # 依次尝试常见平台的方式，全部失败时返回空（调用方回退无参数查询）。
+    ip=$(ip -4 route get 1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
+    if [ -n "$ip" ]; then
+        printf '%s' "$ip"
+        return 0
+    fi
+
+    ip=$(route -n get 1 2>/dev/null | sed -n 's/.*interface: //p' | head -n 1)
+    if [ -n "$ip" ]; then
+        # macOS: 先拿接口名再取 IP
+        ip=$(ifconfig "$ip" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n 1)
+        if [ -n "$ip" ]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    fi
+
+    # BusyBox/Termux 环境：ifconfig 直接输出 inet 地址
+    ip=$(ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '127.0.0.1' | head -n 1)
+    if [ -z "$ip" ]; then
+        ip=$(ifconfig 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '127.0.0.1' | head -n 1)
+    fi
+
+    if [ -n "$ip" ]; then
+        printf '%s' "$ip"
+        return 0
+    fi
+
+    return 1
+}
+
 # 获取当前 Portal 会话的 userIndex
 # 成功时输出 userIndex 并返回 0
+#
+# 实测（与 Go 版本一致）：这台 ePortal 的 redirectortosuccess.jsp
+# 无参数请求时无法定位会话，即使在线也只返回空跳转 Location: http:// ，
+# 必须携带 ?wlanuserip=<本机出口IP> 才能查到会话；
+# 获取不到出口 IP 时回退为无参数请求（兼容其他锐捷部署）。
 get_current_session() {
+    session_url="$PORTAL_BASE/eportal/redirectortosuccess.jsp"
+
+    if wlan_ip=$(get_local_ip); then
+        session_url="$session_url?wlanuserip=$(urlencode "$wlan_ip")"
+    fi
+
     headers=$(curl -s \
         --connect-timeout "$REQUEST_TIMEOUT" \
         --max-time "$REQUEST_TIMEOUT" \
         -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
         -o /dev/null -D - \
-        "$PORTAL_BASE/eportal/redirectortosuccess.jsp" 2>/dev/null) || return 1
+        "$session_url" 2>/dev/null) || return 1
 
     location=$(printf '%s\n' "$headers" | grep -i '^Location:' | head -n 1 | tr -d '\r')
     location=${location#*:}
     # 去掉前导空白
     location=$(printf '%s' "$location" | sed 's/^[[:space:]]*//')
 
+    # 请求成功但没有 Location：视为查询失败（UNKNOWN），交由调用方判断
     if [ -z "$location" ]; then
         return 1
     fi
 
+    # Location 是空地址（http://）或登录页跳转（无 userIndex），
+    # 都是“明确没有登录会话”的确定性信号
     case "$location" in
         *userIndex=*) ;;
-        *) return 1 ;;
+        *) return 2 ;;
     esac
 
     user_index=$(printf '%s' "$location" | sed -n 's/.*[?&]userIndex=\([^&]*\).*/\1/p')
     if [ -z "$user_index" ]; then
-        return 1
+        return 2
     fi
 
     printf '%s' "$user_index"
@@ -368,13 +420,25 @@ get_online_user_info() {
     return 0
 }
 
-# 检查当前是否在线（等价于 Go 版本 GetCurrentUser）
-# 返回 0 = 在线, 1 = 离线, 2 = 查询出错
-# 注意: result=wait 也可能带完整 userId/userIp，所以按 userId + userIp 判断
+# 检查当前是否在线（等价于 Go 版本 GetCurrentUser，三态）
+# 返回 0 = 在线(ONLINE), 1 = 离线(OFFLINE), 2 = 未知(UNKNOWN)
+#
+# 三态判定（与 Go 版本一致）：
+#   - OFFLINE 只来自 Portal 的“明确否定”（登录页跳转/空地址），
+#     网络失败、超时等一律是 UNKNOWN，绝不猜测为离线
+#   - 注意: result=wait 也可能带完整 userId/userIp，所以按 userId + userIp 判断
 check_status() {
-    if ! user_index=$(get_current_session); then
-        # 没有会话视为未登录（与 Go 版本一致）
+    user_index=$(get_current_session)
+    st=$?
+
+    if [ "$st" -eq 2 ]; then
+        # Portal 明确表示没有登录会话
         return 1
+    fi
+
+    if [ "$st" -ne 0 ] || [ -z "$user_index" ]; then
+        # 请求失败/超时：状态未知
+        return 2
     fi
 
     if ! get_online_user_info "$user_index"; then
@@ -385,7 +449,23 @@ check_status() {
         return 0
     fi
 
-    return 1
+    # 信息不完整：只能算未知，不能当成未登录
+    return 2
+}
+
+# 检查互联网连通性（等价于 Go 版本 CheckInternet）
+# 返回 0 = 可用, 1 = 不可用
+# 注意：它只反映互联网可达性，绝不参与登录状态判断
+check_internet() {
+    body=$(curl -s \
+        --connect-timeout "$REQUEST_TIMEOUT" \
+        --max-time "$REQUEST_TIMEOUT" \
+        "https://www.apple.com/library/test/success.html" 2>/dev/null) || return 1
+
+    case "$body" in
+        *Success*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 print_user_info() {
@@ -446,7 +526,8 @@ do_login() {
     i=0
     while [ "$i" -lt 5 ]; do
         sleep 1
-        if check_status; then
+        check_status
+        if [ "$?" -eq 0 ]; then
             return 0
         fi
         i=$((i + 1))
@@ -471,12 +552,12 @@ login_cycle() {
             return 1
         fi
 
-        printf '\n正在尝试账号 [%d/%d]: %s\n' "$idx" "$ACCOUNT_COUNT" "$ACCOUNT_USER"
+        printf '\n[%s] 正在尝试账号 [%d/%d]: %s\n' "$(timestamp)" "$idx" "$ACCOUNT_COUNT" "$ACCOUNT_USER"
 
         if do_login "$ACCOUNT_USER" "$ACCOUNT_PASS"; then
-            printf '登录成功\n'
-            printf '账号: %s\n' "$INFO_USER_ID"
-            printf 'IP: %s\n' "$INFO_USER_IP"
+            printf '[%s] 登录成功\n' "$(timestamp)"
+            printf '[%s] 账号: %s\n' "$(timestamp)" "$INFO_USER_ID"
+            printf '[%s] IP: %s\n' "$(timestamp)" "$INFO_USER_IP"
             match_current_user "$INFO_USER_ID"
             return 0
         fi
@@ -490,8 +571,16 @@ login_cycle() {
 
 # 注销当前登录（独立逻辑，不与自动登录循环耦合）
 do_logout() {
-    if ! user_index=$(get_current_session); then
-        printf '注销失败: 获取当前登录会话失败（当前可能未登录）\n'
+    user_index=$(get_current_session)
+    session_st=$?
+
+    if [ "$session_st" -eq 2 ]; then
+        printf '注销失败: 当前没有登录会话（无需注销）\n'
+        return 1
+    fi
+
+    if [ "$session_st" -ne 0 ]; then
+        printf '注销失败: 获取当前登录会话失败（网络错误或超时）\n'
         return 1
     fi
 
@@ -522,6 +611,20 @@ do_logout() {
 
 # ---------------- 各命令入口 ----------------
 
+# 日志时间戳（等价于 Go 版本的 ts()）
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+# 互联网状态的可读文本
+internet_text() {
+    if [ "$1" -eq 0 ]; then
+        printf '正常'
+    else
+        printf '不可用'
+    fi
+}
+
 cmd_status() {
     printf '正在查询当前认证状态...\n'
     check_status
@@ -537,7 +640,7 @@ cmd_status() {
             exit 0
             ;;
         *)
-            printf '查询认证状态失败\n'
+            printf '当前状态: 未知（无法确认是否在线）\n'
             exit 1
             ;;
     esac
@@ -564,7 +667,9 @@ cmd_once() {
     fi
 
     if [ "$st" -eq 2 ]; then
-        printf '检测当前状态时发生错误，按离线处理。\n'
+        # 无法确定状态时不贸然登录，避免重复上线
+        printf '当前状态未知，无法确认是否在线，本次不执行登录。\n'
+        exit 1
     fi
 
     printf '当前离线，开始尝试登录。\n'
@@ -580,33 +685,141 @@ cmd_once() {
     exit 1
 }
 
-# 持续监控
+# 持续监控（与 Go 版本 Monitor 状态机一致）
+#
+# 状态机规则：
+#   - ONLINE:  清零掉线计数；互联网检测失败只记录，不重新登录
+#   - UNKNOWN: 查询失败/超时，不累计为 OFFLINE，也不重新登录
+#   - OFFLINE: 累计确认，连续达到阈值（3 次）才确认掉线并轮换账号重新登录
+#
+# 日志规则：
+#   - Portal 状态发生变化时打印详细横幅（时间戳、变化前后状态、账号、处理动作）
+#   - 状态无变化时只打印单行心跳日志
 monitor() {
-    printf '\n开始监控，检测间隔: %d 秒\n' "$CHECK_INTERVAL"
+    # 确认掉线所需的连续 OFFLINE 次数
+    OFFLINE_THRESHOLD=3
+
+    printf '\n开始监控，检测间隔: %d 秒（连续 %d 次 OFFLINE 才确认掉线）\n' \
+        "$CHECK_INTERVAL" "$OFFLINE_THRESHOLD"
+
+    offline_count=0
+    # 上一轮 Portal 状态: online / offline / unknown / boot（首轮）
+    last_state="boot"
+    # 最后一次确认 ONLINE 的账号信息
+    last_account=""
+    last_ip=""
 
     while true; do
         interruptible_sleep "$CHECK_INTERVAL"
 
-        if check_status; then
-            printf '[监控] 在线 | 账号: %s | IP: %s\n' "$INFO_USER_ID" "$INFO_USER_IP"
-            match_current_user "$INFO_USER_ID"
-            continue
+        check_status
+        st=$?
+
+        check_internet
+        internet_st=$?
+
+        case "$st" in
+            0) state="online" ;;
+            1) state="offline" ;;
+            *) state="unknown" ;;
+        esac
+
+        if [ "$state" != "$last_state" ]; then
+            state_changed=1
+        else
+            state_changed=0
         fi
 
-        printf '\n========== 检测到连接异常 ==========\n'
-        printf '当前状态: 未登录或会话异常\n'
-        printf '准备尝试下一个账号...\n'
-        printf '====================================\n'
+        case "$state" in
+            online)
+                prev_offline=$offline_count
+                offline_count=0
+                match_current_user "$INFO_USER_ID"
+                last_account=$INFO_USER_ID
+                last_ip=$INFO_USER_IP
 
-        # 当前账号掉线后，从下一个账号开始
-        next_account
+                if [ "$state_changed" -eq 1 ]; then
+                    printf '\n[%s] ========== 状态变化: %s → ONLINE ==========\n' \
+                        "$(timestamp)" "$last_state"
+                    if [ "$prev_offline" -gt 0 ]; then
+                        printf '[%s] 掉线计数清零（此前连续确认: %d/%d）\n' \
+                            "$(timestamp)" "$prev_offline" "$OFFLINE_THRESHOLD"
+                    fi
+                    printf '[%s] 账号: %s | 用户名: %s | IP: %s\n' \
+                        "$(timestamp)" "$INFO_USER_ID" "$INFO_USER_NAME" "$INFO_USER_IP"
+                    printf '[%s] 互联网状态: %s\n' "$(timestamp)" "$(internet_text "$internet_st")"
+                    if [ "$internet_st" -ne 0 ]; then
+                        printf '[%s] 注意：Portal 会话有效，互联网检测失败不触发重新登录\n' "$(timestamp)"
+                    fi
+                    printf '==================================================\n'
+                else
+                    printf '[%s] 心跳: ONLINE | 账号: %s | IP: %s | 互联网: %s\n' \
+                        "$(timestamp)" "$INFO_USER_ID" "$INFO_USER_IP" "$(internet_text "$internet_st")"
+                fi
+                ;;
 
-        if login_cycle; then
-            continue
-        fi
+            unknown)
+                if [ "$state_changed" -eq 1 ]; then
+                    printf '\n[%s] ========== 状态变化: %s → UNKNOWN ==========\n' \
+                        "$(timestamp)" "$last_state"
+                    if [ -n "$last_account" ]; then
+                        printf '[%s] 最后确认在线: 账号 %s | IP: %s\n' \
+                            "$(timestamp)" "$last_account" "$last_ip"
+                    fi
+                    printf '[%s] 原因: Portal 状态查询失败或超时\n' "$(timestamp)"
+                    printf '[%s] 处理: 暂不重新登录，不累计掉线，等待下一轮检测\n' "$(timestamp)"
+                    printf '==================================================\n'
+                else
+                    printf '[%s] 心跳: UNKNOWN | 原因: Portal 状态查询失败或超时\n' "$(timestamp)"
+                fi
+                ;;
 
-        printf '全部账号尝试失败，%d 秒后再次尝试\n' "$RETRY_INTERVAL"
-        interruptible_sleep "$RETRY_INTERVAL"
+            offline)
+                offline_count=$((offline_count + 1))
+
+                if [ "$state_changed" -eq 1 ]; then
+                    printf '\n[%s] ========== 状态变化: %s → OFFLINE ==========\n' \
+                        "$(timestamp)" "$last_state"
+                    if [ -n "$last_account" ]; then
+                        printf '[%s] 掉线账号: %s | IP: %s\n' \
+                            "$(timestamp)" "$last_account" "$last_ip"
+                    fi
+                fi
+
+                if [ "$offline_count" -lt "$OFFLINE_THRESHOLD" ]; then
+                    printf '[%s] 当前状态: OFFLINE | 连续确认: %d/%d | 互联网: %s | 尚未确认掉线，等待下一轮检测\n' \
+                        "$(timestamp)" "$offline_count" "$OFFLINE_THRESHOLD" "$(internet_text "$internet_st")"
+                    continue
+                fi
+
+                # 连续确认达到阈值，正式判定掉线
+                printf '\n[%s] ========== 确认掉线（连续 %d/%d 次 OFFLINE） ==========\n' \
+                    "$(timestamp)" "$offline_count" "$OFFLINE_THRESHOLD"
+                if [ -n "$last_account" ]; then
+                    printf '[%s] 失效账号: %s | IP: %s\n' \
+                        "$(timestamp)" "$last_account" "$last_ip"
+                fi
+                printf '[%s] 互联网状态: %s\n' "$(timestamp)" "$(internet_text "$internet_st")"
+                printf '[%s] 开始账号轮换并重新登录...\n' "$(timestamp)"
+                printf '==================================================\n'
+
+                # 确认掉线后清零计数，重新登录后从头开始统计
+                offline_count=0
+
+                # 当前账号掉线后，从下一个账号开始
+                next_account
+
+                if login_cycle; then
+                    continue
+                fi
+
+                printf '[%s] 全部账号尝试失败，%d 秒后再次尝试\n' \
+                    "$(timestamp)" "$RETRY_INTERVAL"
+                interruptible_sleep "$RETRY_INTERVAL"
+                ;;
+        esac
+
+        last_state=$state
     done
 }
 
@@ -614,7 +827,10 @@ monitor() {
 cmd_monitor() {
     printf '正在检测当前登录状态...\n'
 
-    if check_status; then
+    check_status
+    st=$?
+
+    if [ "$st" -eq 0 ]; then
         printf '\n检测到当前已经登录。\n'
         print_user_info
 
@@ -624,6 +840,15 @@ cmd_monitor() {
             printf '当前账号不在配置列表中。\n'
         fi
 
+        monitor
+        return
+    fi
+
+    if [ "$st" -eq 2 ]; then
+        # 启动时无法确定状态（查询失败/超时）：
+        # 不贸然登录，进入监控模式继续检测，
+        # 由监控状态机在状态明确后再决定是否登录
+        printf '当前登录状态未知，进入监控模式继续检测。\n'
         monitor
         return
     fi

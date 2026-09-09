@@ -14,7 +14,10 @@
 - 后续按照账号列表顺序轮询
 - 启动时自动检测当前是否已经存在登录用户
 - 已登录时不会重复认证
-- 运行过程中持续检测网络状态
+- 运行过程中持续检测 Portal 登录状态与互联网连通性
+- **三态状态机**：Portal 状态区分 `ONLINE` / `OFFLINE` / `UNKNOWN`，网络抖动不会被误判为掉线
+- **掉线连续确认**：连续 3 次 `OFFLINE` 才确认掉线并触发账号轮换，避免瞬时抖动导致无意义重登
+- **互联网检测与登录状态解耦**：`CheckInternet` 失败只记录日志，绝不触发重新登录
 - 网络断开后自动重新认证
 - 当前账号认证失败后自动尝试下一个账号
 - 所有账号均失败后自动等待并重新尝试
@@ -84,9 +87,9 @@ POST /eportal/InterFace.do?method=getOnlineUserInfo
 程序启动
     │
     ▼
-检测当前是否已经登录
+检测当前是否已经登录（三态）
     │
-    ├── 已登录
+    ├── ONLINE（已登录）
     │     │
     │     ▼
     │   获取当前用户信息
@@ -94,7 +97,13 @@ POST /eportal/InterFace.do?method=getOnlineUserInfo
     │     ▼
     │   开始网络监控
     │
-    └── 未登录
+    ├── UNKNOWN（查询失败/超时）
+    │     │
+    │     ▼
+    │   不贸然登录，进入监控模式继续检测
+    │   （由监控状态机在状态明确后再决定是否登录）
+    │
+    └── OFFLINE（未登录）
           │
           ▼
       随机选择账号起点
@@ -410,19 +419,23 @@ chmod +x shell/autologin.sh
 
 `--once` 专为 iSH / Termux 设计：登录成功后立即退出，不进入持续监控，适合由系统快捷指令启动。
 
-Shell 版本与 Go 版本使用完全相同的锐捷认证流程：
+Shell 版本与 Go 版本使用完全相同的锐捷认证流程和监控状态机：
 
 - 通过 `http://119.29.29.29/` 发现 ePortal 登录参数
+- `redirectortosuccess.jsp?wlanuserip=<本机IP>` 查询会话（通过 `ip route` / `ifconfig` 获取出口 IP）
 - `POST /eportal/InterFace.do?method=login` 登录
 - `getOnlineUserInfo` 验证在线（`result=wait` 但带 `userId`/`userIp` 也视为在线）
 - 随机账号起点 + 顺序轮询
+- **三态状态机**（`check_status` 返回 0=在线 / 1=离线 / 2=未知）
+- **连续 3 次 OFFLINE 才确认掉线**，互联网检测（Apple success.html）只记日志不触发重登
+- 状态变化横幅 + 时间戳日志，与 Go 版本格式一致
 
 ## 当前登录用户检测
 
 程序启动时会调用：
 
 ```text
-/eportal/redirectortosuccess.jsp
+/eportal/redirectortosuccess.jsp?wlanuserip=<本机出口IP>
 ```
 
 获取当前认证会话的 `userIndex`，然后调用：
@@ -432,6 +445,12 @@ Shell 版本与 Go 版本使用完全相同的锐捷认证流程：
 ```
 
 获取用户信息。
+
+> **实测说明**（2026-09-09，湖南工业大学 ePortal）：
+> 部分锐捷 ePortal 的 `redirectortosuccess.jsp` 无参数请求时无法定位会话，
+> 即使已经在线也只返回空跳转 `Location: http://`，导致误判离线；
+> 必须携带 `wlanuserip`（本机出口 IP，Go 版用 UDP dial 获取，Shell 版解析路由表）才能查到会话。
+> 程序已内置该处理，无需配置。
 
 例如：
 
@@ -455,12 +474,51 @@ MAC: ec4255cc00c1
 
 因此本项目不会仅根据 `result` 判断是否登录，而会结合用户信息判断当前认证状态。
 
+## 状态三态与掉线确认
+
+监控中 Portal 登录状态区分三态：
+
+| 状态      | 含义       | 判定依据                                                                |
+| --------- | ---------- | ----------------------------------------------------------------------- |
+| `ONLINE`  | 明确在线   | 会话查询跳转带 `userIndex`，且 `userId` + `userIp` 完整                 |
+| `OFFLINE` | 明确未登录 | 会话查询跳转到登录页 / 空地址（无 `userIndex`），是 Portal 的"明确否定" |
+| `UNKNOWN` | 无法确定   | 查询超时、网络失败、信息不完整等一切"没问明白"的情况                    |
+
+核心原则：
+
+- **网络请求失败绝不等于 OFFLINE**。超时、断网等情况一律归为 `UNKNOWN`，等待下一轮检测
+- **互联网连通性检测（CheckInternet）与登录状态完全解耦**。`CheckInternet` 失败只打印日志（"Portal 会话仍然有效，不重新登录"），绝不触发账号轮换
+- **掉线需要连续 3 次确认**。单次 `OFFLINE` 可能只是 Portal 侧瞬时抖动；连续 3 次 `OFFLINE` 才确认掉线并开始账号轮换。期间恢复 `ONLINE` 立即清零计数；`UNKNOWN` 不累计也不清零
+
+```text
+监控循环
+    │
+    ├── ONLINE
+    │     清零掉线计数，打印心跳日志
+    │     （互联网检测失败只记录，不重登）
+    │
+    ├── UNKNOWN
+    │     打印原因（查询超时/网络失败），暂不重新登录
+    │
+    └── OFFLINE
+          连续确认 1/3, 2/3 → 等待下一轮
+          连续确认 3/3     → 确认掉线
+                             → 账号轮换 + 重新登录
+                             → 成功后恢复监控
+```
+
+> **为什么这样设计**：登录成功后刚建立会话的窗口期内，
+> 网关对新连接的放行存在传播延迟，此时互联网检测可能临时失败，
+> 但 Portal 会话实际有效。如果用 `CheckInternet` 判断掉线，
+> 会触发无意义的账号轮换（且在线状态下参数探测地址返回 404，
+> 拿不到 ePortal URL，轮换必然失败）。实测抓包已验证该场景真实存在。
+
 ## 注销原理
 
 `--logout` 首先获取当前会话：
 
 ```text
-GET /eportal/redirectortosuccess.jsp
+GET /eportal/redirectortosuccess.jsp?wlanuserip=<本机出口IP>
 ```
 
 得到：
@@ -485,24 +543,22 @@ userIndex=...
 
 ## 网络监控
 
-程序运行过程中会周期性检查互联网连接。
+程序运行过程中会周期性（默认每 10 秒，`checkInterval` 配置）检查 Portal 登录状态与互联网连通性。
 
-默认：
+监控基于三态状态机（详见上文"状态三态与掉线确认"）：
 
-```json
-"checkInterval": 10
-```
+- 状态无变化时打印单行心跳日志
+- Portal 状态发生变化时打印详细横幅（时间戳、变化前后状态、账号、处理动作）
+- 互联网状态单独跟踪，变化时也打印横幅，但绝不触发重新登录
 
-即每 10 秒检查一次。
-
-发现当前连接异常后：
+确认掉线（连续 3 次 `OFFLINE`）后的处理流程：
 
 ```text
-当前账号掉线
+当前账号掉线（连续 3 次确认）
     ↓
 切换到下一个账号
     ↓
-获取新的 Portal 参数
+获取新的 Portal 参数（请求 http://119.29.29.29/）
     ↓
 重新认证
     ↓
@@ -510,6 +566,10 @@ userIndex=...
     ↓
 继续监控
 ```
+
+> 注意：参数探测地址 `http://119.29.29.29/` **只在确认需要重新登录时才请求**，
+> 正常监控状态下不会反复请求它。在线状态下该地址会返回 404（网关直接放行），
+> 拿不到 ePortal URL——这正是掉线误判会导致登录必然失败的原因。
 
 ## 安全说明
 
@@ -534,7 +594,7 @@ config.json
 当前实现基于实际抓包验证的 ePortal 接口：
 
 ```text
-GET  /eportal/redirectortosuccess.jsp
+GET  /eportal/redirectortosuccess.jsp?wlanuserip=<本机出口IP>
 
 POST /eportal/InterFace.do?method=getOnlineUserInfo
 
@@ -560,8 +620,9 @@ http://119.29.29.29/
 - 当前登录用户检测
 - 多账号顺序轮询
 - 启动随机轮询起点
-- 掉线重新认证
+- 掉线重新认证（三态状态机 + 连续 3 次确认）
 - `--logout` 注销当前登录
+- 浏览器完整认证流程抓包比对（2026-09-09）：登录/注销表单字段、`passwordEncrypt=false`、`keepaliveInterval=0`（无需客户端保活）均与程序实现一致
 
 后续可以继续扩展：
 

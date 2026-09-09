@@ -59,20 +59,22 @@ func runStatus(client *ruijie.Client, cfg *ruijie.Config) {
 	ctx, cancel := timeoutCtx(context.Background(), cfg)
 	defer cancel()
 
-	user, loggedIn, err := client.GetCurrentUser(ctx)
+	user, state, err := client.GetCurrentUser(ctx)
 
 	if err != nil {
 		fmt.Printf("查询认证状态失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	if loggedIn {
+	switch state {
+	case ruijie.PortalOnline:
 		fmt.Println("当前状态: 在线")
 		ruijie.PrintUserInfo(user)
-		return
+	case ruijie.PortalOffline:
+		fmt.Println("当前状态: 离线")
+	default:
+		fmt.Println("当前状态: 未知（无法确认是否在线）")
 	}
-
-	fmt.Println("当前状态: 离线")
 }
 
 // runLogout 注销当前登录后退出，不进入监控，不自动重新登录。
@@ -103,16 +105,22 @@ func runOnce(client *ruijie.Client, cfg *ruijie.Config) {
 
 	fmt.Println("正在检测当前登录状态...")
 
-	user, loggedIn, err := client.GetCurrentUser(ctx)
+	user, state, err := client.GetCurrentUser(ctx)
 
 	if err != nil {
 		fmt.Printf("检测当前状态时发生错误: %v\n", err)
 	}
 
-	if loggedIn {
+	if state == ruijie.PortalOnline {
 		fmt.Println("当前已经在线，无需重复登录。")
 		ruijie.PrintUserInfo(user)
 		return
+	}
+
+	if state == ruijie.PortalUnknown {
+		// 无法确定状态时不贸然登录，避免重复上线。
+		fmt.Println("当前状态未知，无法确认是否在线，本次不执行登录。")
+		os.Exit(1)
 	}
 
 	fmt.Println("当前离线，开始尝试登录。")
@@ -151,7 +159,7 @@ func main() {
 	}
 
 	fmt.Println("===================================")
-	fmt.Println("     Ruijie Campus Auto Login")
+	fmt.Println("     Ruijie Auto Login")
 	fmt.Println("===================================")
 
 	client, cfg := newClient()
@@ -185,7 +193,7 @@ func main() {
 
 	checkCtx, checkCancel := timeoutCtx(ctx, cfg)
 
-	user, loggedIn, err := client.GetCurrentUser(checkCtx)
+	user, state, err := client.GetCurrentUser(checkCtx)
 
 	checkCancel()
 
@@ -193,7 +201,8 @@ func main() {
 		fmt.Printf("检测当前状态时发生错误: %v\n", err)
 	}
 
-	if loggedIn {
+	switch state {
+	case ruijie.PortalOnline:
 		fmt.Println()
 		fmt.Println("检测到当前已经登录。")
 
@@ -213,6 +222,16 @@ func main() {
 			fmt.Println("掉线后将随机选择轮询起点。")
 		}
 
+		manager.Monitor(ctx)
+		return
+
+	case ruijie.PortalUnknown:
+		/*
+			启动时无法确定状态（查询失败/超时）：
+			不贸然登录，进入监控模式继续检测，
+			由监控状态机在状态明确后再决定是否登录。
+		*/
+		fmt.Println("当前登录状态未知，进入监控模式继续检测。")
 		manager.Monitor(ctx)
 		return
 	}

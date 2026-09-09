@@ -101,12 +101,9 @@ func (c *Client) LoginAndVerify(ctx context.Context, account Account) (*UserInfo
 	for i := 0; i < 5; i++ {
 		time.Sleep(500 * time.Millisecond)
 
-		user, loggedIn, err := c.GetCurrentUser(ctx)
-		if err != nil {
-			continue
-		}
+		user, state, _ := c.GetCurrentUser(ctx)
 
-		if loggedIn {
+		if state == PortalOnline {
 			return user, nil
 		}
 	}
